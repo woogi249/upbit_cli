@@ -1,0 +1,36 @@
+[tool.poetry]
+name = "upbit-cli"
+version = "0.1.0"
+description = "AI-agent-first Upbit CLI with predictable JSON output."
+authors = ["Your Name <you@example.com>"]
+license = "MIT"
+readme = "README.md"
+packages = [{ include = "upbit_cli" }]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+typer = { extras = ["all"], version = "^0.12.0" }
+httpx = "^0.27.0"
+pydantic = "^2.6.0"
+tenacity = "^8.2.0"
+rich = "^13.7.0"
+PyJWT = "^2.9.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+pytest-asyncio = "^0.24.0"
+respx = "^0.21.0"
+
+[tool.poetry.scripts]
+upbit = "upbit_cli.main:main"
+
+[build-system]
+requires = ["poetry-core>=1.8.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-v --tb=short"
