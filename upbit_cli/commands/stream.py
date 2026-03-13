@@ -1,8 +1,9 @@
 """
-WebSocket stream commands: ticker, orderbook (public); my-order, my-asset (private).
+WebSocket stream commands: ticker, orderbook, trade, candle (public); my-order, my-asset (private).
 
 Output is NDJSON (one JSON per line) to stdout. --count and --duration ensure agents do not hang.
 Private streams require API credentials; JWT is passed to ws_client and masked in logs.
+Compact models use integer timestamp only (no string date/time) for agent token optimization.
 """
 
 from __future__ import annotations
@@ -181,6 +182,131 @@ class MyAssetStreamCompact(BaseModel):
             return None
 
 
+class TradeStreamCompact(BaseModel):
+    """Minimal trade (fill) message. Only integer timestamp for agent delta calculation; no string date/time."""
+
+    model_config = ConfigDict(extra="ignore", arbitrary_types_allowed=False)
+    type: Optional[str] = None
+    code: Optional[str] = None
+    trade_price: Optional[Decimal] = None
+    trade_volume: Optional[Decimal] = None
+    ask_bid: Optional[str] = None
+    timestamp: Optional[int] = None
+    sequential_id: Optional[int] = None
+    stream_type: Optional[str] = None
+
+    @field_serializer("trade_price", "trade_volume", when_used="json")
+    def _ser(self, v: Optional[Decimal]) -> str:
+        if v is None:
+            return "0"
+        return format(v, "f")
+
+    @classmethod
+    def from_ws_message(cls, msg: Any) -> Optional["TradeStreamCompact"]:
+        if not isinstance(msg, dict):
+            return None
+        try:
+            def _dec(key: str) -> Optional[Decimal]:
+                val = msg.get(key)
+                if val is None:
+                    return None
+                return Decimal(str(val))
+
+            ts = msg.get("timestamp")
+            if ts is not None and not isinstance(ts, int):
+                try:
+                    ts = int(ts)
+                except (TypeError, ValueError):
+                    ts = None
+            sid = msg.get("sequential_id")
+            if sid is not None and not isinstance(sid, int):
+                try:
+                    sid = int(sid)
+                except (TypeError, ValueError):
+                    sid = None
+            if ts is None and msg.get("trade_timestamp") is not None:
+                try:
+                    ts = int(msg["trade_timestamp"])
+                except (TypeError, ValueError):
+                    pass
+
+            return cls(
+                type=msg.get("type"),
+                code=msg.get("code"),
+                trade_price=_dec("trade_price"),
+                trade_volume=_dec("trade_volume"),
+                ask_bid=msg.get("ask_bid"),
+                timestamp=ts,
+                sequential_id=sid,
+                stream_type=msg.get("stream_type"),
+            )
+        except Exception:
+            return None
+
+
+class CandleStreamCompact(BaseModel):
+    """Minimal candle message. Only integer timestamp; no string date/time fields."""
+
+    model_config = ConfigDict(extra="ignore", arbitrary_types_allowed=False)
+    type: Optional[str] = None
+    code: Optional[str] = None
+    timestamp: Optional[int] = None
+    opening_price: Optional[Decimal] = None
+    high_price: Optional[Decimal] = None
+    low_price: Optional[Decimal] = None
+    trade_price: Optional[Decimal] = None
+    candle_acc_trade_volume: Optional[Decimal] = None
+    candle_acc_trade_price: Optional[Decimal] = None
+    stream_type: Optional[str] = None
+
+    @field_serializer(
+        "opening_price",
+        "high_price",
+        "low_price",
+        "trade_price",
+        "candle_acc_trade_volume",
+        "candle_acc_trade_price",
+        when_used="json",
+    )
+    def _ser(self, v: Optional[Decimal]) -> str:
+        if v is None:
+            return "0"
+        return format(v, "f")
+
+    @classmethod
+    def from_ws_message(cls, msg: Any) -> Optional["CandleStreamCompact"]:
+        if not isinstance(msg, dict):
+            return None
+        try:
+            def _dec(key: str) -> Optional[Decimal]:
+                val = msg.get(key)
+                if val is None:
+                    return None
+                return Decimal(str(val))
+
+            ts = msg.get("timestamp")
+            if ts is not None and not isinstance(ts, int):
+                try:
+                    ts = int(ts)
+                except (TypeError, ValueError):
+                    ts = None
+
+            return cls(
+                type=msg.get("type"),
+                code=msg.get("code"),
+                timestamp=ts,
+                opening_price=_dec("opening_price"),
+                high_price=_dec("high_price"),
+                low_price=_dec("low_price"),
+                trade_price=_dec("trade_price"),
+                candle_acc_trade_volume=_dec("candle_acc_trade_volume"),
+                candle_acc_trade_price=_dec("candle_acc_trade_price"),
+                stream_type=msg.get("stream_type"),
+            )
+        except Exception:
+            return None
+
+
 def _print_stderr_error(error_code: str, message: str, **kwargs: Any) -> None:
     payload = {"success": False, "error_code": error_code, "message": message, **kwargs}
     print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), file=sys.stderr)
@@ -273,6 +399,78 @@ def orderbook(
         return json.dumps(msg, ensure_ascii=False, separators=(",", ":"))
 
     _run_stream("orderbook", markets, fmt, count, duration, compact, on_message, token=None)
+
+
+# ---------- Public: trade ----------
+
+
+@stream_app.command("trade")
+def trade(
+    market: str = typer.Option(..., "--market", "-m", help="Market code, e.g. KRW-BTC."),
+    count: int = typer.Option(0, "--count", "-c", help="Stop after N messages (0 = unlimited)."),
+    duration: int = typer.Option(0, "--duration", "-d", help="Stop after N seconds (0 = unlimited)."),
+    format_type: str = typer.Option("default", "--format", "-f", help="default or simple."),
+    compact: bool = typer.Option(True, "--compact/--no-compact", help="Output compact JSON (default: compact)."),
+) -> None:
+    """Stream real-time trade (fill) events as NDJSON. Use --count or --duration to avoid infinite run. AI Agents should monitor the sequential_id to detect dropped packets/gaps in the real-time trade stream."""
+    markets = [m.strip() for m in market.split(",") if m.strip()]
+    if not markets:
+        _print_stderr_error("VALIDATION_ERROR", "At least one market required.")
+        raise typer.Exit(1)
+    fmt = "SIMPLE" if format_type.lower() == "simple" else "DEFAULT"
+
+    def on_message(msg: Any) -> Optional[str]:
+        if compact:
+            t = TradeStreamCompact.from_ws_message(msg)
+            if t is not None:
+                return t.model_dump_json(exclude_none=True)
+        return json.dumps(msg, ensure_ascii=False, separators=(",", ":"))
+
+    _run_stream("trade", markets, fmt, count, duration, compact, on_message, token=None)
+
+
+# ---------- Public: candle ----------
+
+CANDLE_UNITS = ("1s", "1m", "3m", "5m", "10m", "15m", "30m", "60m", "240m", "1d", "1w", "1M")
+
+
+@stream_app.command("candle")
+def candle(
+    market: str = typer.Option(..., "--market", "-m", help="Market code, e.g. KRW-BTC."),
+    unit: str = typer.Option(
+        "1m",
+        "--unit",
+        "-u",
+        help="Candle interval: 1s, 1m, 3m, 5m, 10m, 15m, 30m, 60m, 240m, 1d, 1w, 1M (capital M for months).",
+    ),
+    count: int = typer.Option(0, "--count", "-c", help="Stop after N messages (0 = unlimited)."),
+    duration: int = typer.Option(0, "--duration", "-d", help="Stop after N seconds (0 = unlimited)."),
+    format_type: str = typer.Option("default", "--format", "-f", help="default or simple."),
+    compact: bool = typer.Option(True, "--compact/--no-compact", help="Output compact JSON (default: compact)."),
+) -> None:
+    """Stream real-time candle (OHLCV) updates as NDJSON. Use --count or --duration to avoid infinite run."""
+    if unit not in CANDLE_UNITS:
+        _print_stderr_error(
+            "VALIDATION_ERROR",
+            f"unit must be one of: {', '.join(CANDLE_UNITS)}",
+            suggested_action="use_valid_candle_unit",
+        )
+        raise typer.Exit(1)
+    markets = [m.strip() for m in market.split(",") if m.strip()]
+    if not markets:
+        _print_stderr_error("VALIDATION_ERROR", "At least one market required.")
+        raise typer.Exit(1)
+    fmt = "SIMPLE" if format_type.lower() == "simple" else "DEFAULT"
+    stream_type = f"candle.{unit}"
+
+    def on_message(msg: Any) -> Optional[str]:
+        if compact:
+            c = CandleStreamCompact.from_ws_message(msg)
+            if c is not None:
+                return c.model_dump_json(exclude_none=True)
+        return json.dumps(msg, ensure_ascii=False, separators=(",", ":"))
+
+    _run_stream(stream_type, markets, fmt, count, duration, compact, on_message, token=None)
 
 
 # ---------- Private: my-order ----------

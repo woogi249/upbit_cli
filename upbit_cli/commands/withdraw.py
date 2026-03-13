@@ -1,7 +1,8 @@
 """
-Withdrawal commands: list, get.
+Withdrawal commands: list, get, krw, coin.
 
 Requires JWT. Compact keeps currency, amount (string), state, txid, uuid.
+Withdrawal APIs use no-retry to avoid double-withdrawals. KRW success includes 2FA hint for agents.
 """
 
 from __future__ import annotations
@@ -13,14 +14,14 @@ from decimal import Decimal
 from typing import Any, List, Optional
 
 import typer
-from pydantic import BaseModel, ConfigDict, field_serializer
+from pydantic import BaseModel, ConfigDict, field_serializer, model_validator
 from rich.console import Console
 from rich.table import Table
 
 from upbit_cli.auth import get_credentials
 from upbit_cli.http_client import AuthError, UpbitAPIError, request_json_private
 
-withdraw_app = typer.Typer(help="Withdrawals (list, get). Requires API credentials.")
+withdraw_app = typer.Typer(help="Withdrawals (list, get, krw, coin). Requires API credentials.")
 
 
 class WithdrawRaw(BaseModel):
@@ -59,19 +60,52 @@ class WithdrawCompact(BaseModel):
         )
 
 
-def _print_success_stdout(data: Any) -> None:
-    print(json.dumps({"success": True, "data": data}, ensure_ascii=False, separators=(",", ":")))
+class WithdrawCoinPayload(BaseModel):
+    """Strict payload for POST /withdraws/coin. amount must be > 0."""
+
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=False)
+
+    currency: str
+    net_type: str
+    amount: Decimal
+    address: str
+    secondary_address: Optional[str] = None
+    transaction_type: Optional[str] = None  # default | internal
+
+    @field_serializer("amount", when_used="json")
+    def _ser_amount(self, v: Decimal) -> str:
+        return format(v, "f")
+
+    @model_validator(mode="after")
+    def amount_positive(self) -> "WithdrawCoinPayload":
+        if self.amount <= 0:
+            raise ValueError("amount must be greater than 0")
+        return self
+
+
+def _print_success_stdout(data: Any, suggested_action: Optional[str] = None) -> None:
+    payload: dict = {"success": True, "data": data}
+    if suggested_action is not None:
+        payload["suggested_action"] = suggested_action
+    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
 
 def _print_error_stderr(
-    error_code: str, message: str, *, status_code: Optional[int] = None,
-    details: Optional[dict] = None, exit_code: int = 1,
+    error_code: str,
+    message: str,
+    *,
+    status_code: Optional[int] = None,
+    details: Optional[dict] = None,
+    suggested_action: Optional[str] = None,
+    exit_code: int = 1,
 ) -> None:
     out = {"success": False, "error_code": error_code, "message": message}
     if status_code is not None:
         out["status_code"] = status_code
     if details:
         out["details"] = details
+    if suggested_action is not None:
+        out["suggested_action"] = suggested_action
     print(json.dumps(out, ensure_ascii=False, separators=(",", ":")), file=sys.stderr)
     sys.stderr.flush()
     raise typer.Exit(code=exit_code)
@@ -166,6 +200,123 @@ def get_withdrawal(
         asyncio.run(_get_impl(uuid_str=uuid_str, compact=compact, use_rich=_is_rich(ctx)))
     except AuthError as e:
         _print_error_stderr(e.error_code, e.message, exit_code=e.exit_code)
+    except UpbitAPIError as e:
+        _print_error_stderr(e.error_code, e.message, status_code=e.status_code, details=e.details, exit_code=e.exit_code)
+    except Exception as e:
+        _print_error_stderr("UNEXPECTED_ERROR", str(e), exit_code=1)
+
+
+async def _withdraw_krw_impl(amount: str, two_factor_type: str) -> None:
+    creds = get_credentials()
+    if creds is None:
+        raise AuthError(message="Missing API credentials.")
+    raw_json = await request_json_private(
+        "POST",
+        "/withdraws/krw",
+        credentials=creds,
+        json_body={"amount": amount, "two_factor_type": two_factor_type},
+        allow_retry=False,
+    )
+    _print_success_stdout(raw_json, suggested_action="await_human_2fa_approval")
+
+
+@withdraw_app.command("krw")
+def withdraw_krw(
+    ctx: typer.Context,
+    amount: str = typer.Option(..., "--amount", "-a", help="Withdrawal amount (e.g. 10000)."),
+    two_factor_type: str = typer.Option(
+        ...,
+        "--two-factor-type",
+        "-t",
+        help="2FA channel: kakao or naver. Human must approve in app.",
+    ),
+) -> None:
+    """Request KRW withdrawal. No retries; 2FA must be approved by human. Success includes suggested_action for agents."""
+    if two_factor_type not in ("kakao", "naver"):
+        _print_error_stderr(
+            "VALIDATION_ERROR",
+            "two_factor_type must be 'kakao' or 'naver'.",
+            exit_code=1,
+        )
+    try:
+        asyncio.run(_withdraw_krw_impl(amount=amount, two_factor_type=two_factor_type))
+    except AuthError as e:
+        _print_error_stderr(e.error_code, e.message, exit_code=e.exit_code, suggested_action="terminate_and_ask_human")
+    except UpbitAPIError as e:
+        _print_error_stderr(e.error_code, e.message, status_code=e.status_code, details=e.details, exit_code=e.exit_code)
+    except Exception as e:
+        _print_error_stderr("UNEXPECTED_ERROR", str(e), exit_code=1)
+
+
+def _withdraw_coin_body(payload: WithdrawCoinPayload) -> dict:
+    d = payload.model_dump(mode="json")
+    return {k: v for k, v in d.items() if v is not None}
+
+
+async def _withdraw_coin_impl(
+    currency: str,
+    net_type: str,
+    amount: Decimal,
+    address: str,
+    secondary_address: Optional[str],
+    transaction_type: Optional[str],
+) -> None:
+    creds = get_credentials()
+    if creds is None:
+        raise AuthError(message="Missing API credentials.")
+    payload = WithdrawCoinPayload(
+        currency=currency,
+        net_type=net_type,
+        amount=amount,
+        address=address,
+        secondary_address=secondary_address,
+        transaction_type=transaction_type,
+    )
+    body = _withdraw_coin_body(payload)
+    raw_json = await request_json_private(
+        "POST",
+        "/withdraws/coin",
+        credentials=creds,
+        json_body=body,
+        allow_retry=False,
+    )
+    _print_success_stdout(raw_json)
+
+
+@withdraw_app.command("coin")
+def withdraw_coin(
+    ctx: typer.Context,
+    currency: str = typer.Option(..., "--currency", "-c", help="Currency code (e.g. BTC)."),
+    net_type: str = typer.Option(..., "--net-type", "-n", help="Withdrawal network (e.g. BTC, TRX)."),
+    amount: str = typer.Option(..., "--amount", "-a", help="Withdrawal amount (must be > 0)."),
+    address: str = typer.Option(..., "--address", help="Pre-registered withdrawal address."),
+    secondary_address: Optional[str] = typer.Option(None, "--secondary-address", help="Destination tag / memo if required."),
+    transaction_type: Optional[str] = typer.Option(
+        None,
+        "--transaction-type",
+        help="default (general) or internal (same-exchange transfer).",
+    ),
+) -> None:
+    """Request digital asset withdrawal. No retries. Amount must be > 0; address must be pre-registered."""
+    try:
+        amount_dec = Decimal(amount)
+    except Exception:
+        _print_error_stderr("VALIDATION_ERROR", "amount must be a valid number.", exit_code=1)
+    try:
+        asyncio.run(
+            _withdraw_coin_impl(
+                currency=currency,
+                net_type=net_type,
+                amount=amount_dec,
+                address=address,
+                secondary_address=secondary_address,
+                transaction_type=transaction_type,
+            )
+        )
+    except ValueError as e:
+        _print_error_stderr("VALIDATION_ERROR", str(e), exit_code=1)
+    except AuthError as e:
+        _print_error_stderr(e.error_code, e.message, exit_code=e.exit_code, suggested_action="terminate_and_ask_human")
     except UpbitAPIError as e:
         _print_error_stderr(e.error_code, e.message, status_code=e.status_code, details=e.details, exit_code=e.exit_code)
     except Exception as e:

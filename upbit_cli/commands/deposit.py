@@ -1,7 +1,8 @@
 """
-Deposit commands: list, get.
+Deposit commands: list, get, generate-address.
 
 Requires JWT. Compact keeps currency, amount (string), state, txid, uuid.
+Generate-address returns status 'generating' with suggested_action when address is not yet ready.
 """
 
 from __future__ import annotations
@@ -64,14 +65,21 @@ def _print_success_stdout(data: Any) -> None:
 
 
 def _print_error_stderr(
-    error_code: str, message: str, *, status_code: Optional[int] = None,
-    details: Optional[dict] = None, exit_code: int = 1,
+    error_code: str,
+    message: str,
+    *,
+    status_code: Optional[int] = None,
+    details: Optional[dict] = None,
+    suggested_action: Optional[str] = None,
+    exit_code: int = 1,
 ) -> None:
     out = {"success": False, "error_code": error_code, "message": message}
     if status_code is not None:
         out["status_code"] = status_code
     if details:
         out["details"] = details
+    if suggested_action is not None:
+        out["suggested_action"] = suggested_action
     print(json.dumps(out, ensure_ascii=False, separators=(",", ":")), file=sys.stderr)
     sys.stderr.flush()
     raise typer.Exit(code=exit_code)
@@ -166,6 +174,48 @@ def get_deposit(
         asyncio.run(_get_impl(uuid_str=uuid_str, compact=compact, use_rich=_is_rich(ctx)))
     except AuthError as e:
         _print_error_stderr(e.error_code, e.message, exit_code=e.exit_code)
+    except UpbitAPIError as e:
+        _print_error_stderr(e.error_code, e.message, status_code=e.status_code, details=e.details, exit_code=e.exit_code)
+    except Exception as e:
+        _print_error_stderr("UNEXPECTED_ERROR", str(e), exit_code=1)
+
+
+async def _generate_address_impl(currency: str, net_type: str) -> None:
+    creds = get_credentials()
+    if creds is None:
+        raise AuthError(message="Missing API credentials.")
+    raw_json = await request_json_private(
+        "POST",
+        "/deposits/generate_coin_address",
+        credentials=creds,
+        json_body={"currency": currency, "net_type": net_type},
+    )
+    if not isinstance(raw_json, dict):
+        _print_success_stdout(raw_json)
+        return
+    deposit_address = raw_json.get("deposit_address") if isinstance(raw_json.get("deposit_address"), str) else None
+    if not deposit_address and raw_json.get("deposit_address") is None:
+        data = {
+            "status": "generating",
+            "suggested_action": "sleep_and_check_again",
+            "raw": raw_json,
+        }
+    else:
+        data = raw_json
+    _print_success_stdout(data)
+
+
+@deposit_app.command("generate-address")
+def generate_address(
+    ctx: typer.Context,
+    currency: str = typer.Option(..., "--currency", "-c", help="Currency code (e.g. BTC, USDT)."),
+    net_type: str = typer.Option(..., "--net-type", "-n", help="Network type (e.g. BTC, TRX). Required since 2023-05-23."),
+) -> None:
+    """Request generation of a deposit address. If address is not ready, returns status 'generating' and suggested_action."""
+    try:
+        asyncio.run(_generate_address_impl(currency=currency, net_type=net_type))
+    except AuthError as e:
+        _print_error_stderr(e.error_code, e.message, exit_code=e.exit_code, suggested_action="terminate_and_ask_human")
     except UpbitAPIError as e:
         _print_error_stderr(e.error_code, e.message, status_code=e.status_code, details=e.details, exit_code=e.exit_code)
     except Exception as e:

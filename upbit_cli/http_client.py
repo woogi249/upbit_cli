@@ -222,12 +222,15 @@ async def request_json_private(
     params: Optional[Dict[str, Any]] = None,
     json_body: Optional[Dict[str, Any]] = None,
     timeout: float = 10.0,
+    allow_retry: bool = True,
 ) -> Any:
     """
     Perform authenticated JSON request to Upbit private API.
 
     JWT is built with query_hash: for GET, hash of query string; for POST/DELETE, hash of JSON body.
-    Raises AuthError if credentials is None. Uses same retry logic as request_json.
+    Raises AuthError if credentials is None.
+    When allow_retry is True, retries on 429 and 5xx. When False (e.g. withdrawal APIs with no
+    idempotency), no retries are performed to avoid double-withdrawals on timeout.
     """
     from upbit_cli.auth import JWTOptions, generate_jwt
 
@@ -243,6 +246,27 @@ async def request_json_private(
     options = JWTOptions(query_hash=query_hash, query_hash_alg="SHA512")
     token = generate_jwt(credentials, options)
     headers = {"Authorization": f"Bearer {token}"}
+
+    async def _one_request() -> Any:
+        if json_body is not None:
+            return await _do_request(
+                method=method,
+                path=path,
+                headers=headers,
+                json_body=json_body,
+                timeout=timeout,
+            )
+        return await _do_request(
+            method=method,
+            path=path,
+            params=params,
+            headers=headers,
+            timeout=timeout,
+        )
+
+    if not allow_retry:
+        return await _one_request()
+
     async for attempt in AsyncRetrying(
         retry=retry_if_exception_type(RetryableUpbitError),
         wait=wait_exponential(multiplier=0.5, min=0.5, max=5),
@@ -250,19 +274,5 @@ async def request_json_private(
         reraise=True,
     ):
         with attempt:
-            if json_body is not None:
-                return await _do_request(
-                    method=method,
-                    path=path,
-                    headers=headers,
-                    json_body=json_body,
-                    timeout=timeout,
-                )
-            return await _do_request(
-                method=method,
-                path=path,
-                params=params,
-                headers=headers,
-                timeout=timeout,
-            )
+            return await _one_request()
     return None  # unreachable
