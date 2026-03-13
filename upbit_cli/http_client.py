@@ -227,10 +227,11 @@ async def request_json_private(
     """
     Perform authenticated JSON request to Upbit private API.
 
-    JWT is built with query_hash: for GET, hash of query string; for POST/DELETE, hash of JSON body.
-    Raises AuthError if credentials is None.
-    When allow_retry is True, retries on 429 and 5xx. When False (e.g. withdrawal APIs with no
-    idempotency), no retries are performed to avoid double-withdrawals on timeout.
+    JWT is built with query_hash: for GET or DELETE with params, hash of URL-encoded query string;
+    for POST or DELETE with json_body, hash of JSON body. Upbit DELETE /withdraws/coin uses query
+    params only (no body). Raises AuthError if credentials is None. When allow_retry is True,
+    retries on 429 and 5xx. When False (e.g. withdrawal/deposit APIs with no idempotency), no
+    retries are performed to avoid double operations on timeout.
     """
     from upbit_cli.auth import JWTOptions, generate_jwt
 
@@ -239,7 +240,7 @@ async def request_json_private(
             message="Missing API credentials. Set UPBIT_ACCESS_KEY and UPBIT_SECRET_KEY or run 'upbit configure'.",
         )
     method_upper = method.upper()
-    if method_upper == "GET":
+    if method_upper == "GET" or (method_upper == "DELETE" and params):
         query_hash = _compute_query_hash_for_get(params)
     else:
         query_hash = _compute_query_hash_for_body(json_body)

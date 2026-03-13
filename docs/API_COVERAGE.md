@@ -1,65 +1,68 @@
-# 업비트 API 대비 CLI 구현 현황
+# 업비트 API / WebSocket 구현 현황
 
-업비트 공식 API 문서([docs.upbit.com/reference](https://docs.upbit.com/reference)) 기준으로, 현재 upbit_cli에 구현된 기능과 **미구현** 기능을 정리한 문서입니다.
-
----
-
-## 1. 요약
-
-| 구분 | 업비트 제공 | 현재 구현 | 미구현 |
-|------|-------------|-----------|--------|
-| **시세 조회 (Quotation)** | 5개 영역 | 5개 영역 (전체) | 없음 |
-| **거래/자산 (Exchange)** | 5개 영역 | 0개 (인증·JWT만 준비) | 전부 |
-
-- **시세 조회**: 인증 없이 사용 가능 (Public).
-- **거래/자산**: API Key(JWT) 인증 필요 (Private). `auth.py`의 `get_credentials`, `generate_jwt`만 구현되어 있고, 실제 계정/주문/입출금 API 호출은 없음.
+공식 문서 기준으로 CLI 구현 여부를 점검한 결과입니다.
 
 ---
 
-## 2. 시세 조회 (Quotation) API
+## 1. REST API
 
-### 2.1 구현됨
+### 시세 조회 (Quotation) — 전부 구현됨
 
-| 기능 | 업비트 API | CLI 명령 | 비고 |
-|------|------------|----------|------|
-| **현재가 (Ticker)** | `GET /v1/ticker` | `upbit market get-ticker --market KRW-BTC` | `--compact` 지원 |
-| **호가 (Orderbook)** | `GET /v1/orderbook` | `upbit market get-orderbook --market KRW-BTC` | `--limit`, `--compact` 지원 |
-| **캔들 (OHLCV)** | `GET /v1/candles/seconds\|minutes\|days\|weeks\|months` | `upbit market get-candles --market KRW-BTC --unit seconds\|minutes\|days\|weeks\|months` | `--to` ISO 8601, `--limit` 200 상한 |
-| **페어 목록** | `GET /v1/market/all` | `upbit market list-markets` | `--quote` (KRW/USDT 등), `--limit`, `--details` |
-| **최근 체결 내역** | `GET /v1/trades/ticks` | `upbit market get-trades --market KRW-BTC` | `--cursor`(sequential_id), `--to` ISO 8601, `--limit` 500 상한 |
-| **호가 정책** | `GET /v1/orderbook/instruments` | `upbit market get-orderbook-instruments --markets KRW-BTC,KRW-ETH` | tick_size, quote_currency 등 |
+| 기능 | 메서드/경로 | CLI 커맨드 | 상태 |
+|------|-------------|------------|------|
+| 페어 목록 | GET /market/all | `market list-markets` | ✅ |
+| 현재가 | GET /ticker | `market get-ticker` | ✅ |
+| 호가 | GET /orderbook | `market get-orderbook` | ✅ |
+| 호가 정책 | GET /orderbook/instruments | `market get-orderbook-instruments` | ✅ |
+| 체결 이력 | GET /trades/ticks | `market get-trades` | ✅ |
+| 캔들(초/분/일/주/월) | GET /candles/seconds, minutes, days, weeks, months | `market get-candles` | ✅ |
 
-### 2.2 미구현 (시세 조회)
+### 거래·자산 (Exchange) — 대부분 구현됨
 
-시세 조회(Quotation) 관련 API는 위 표 기준으로 **전부 구현**됨. (캔들 연봉 등 문서상 추가 엔드포인트는 필요 시 확장 가능.)
-
----
-
-## 3. 거래 및 자산 (Exchange) API
-
-전부 **미구현**입니다. JWT 생성·인증 로직(`auth.py`)만 준비된 상태입니다.
-
-| 영역 | 업비트 제공 기능 | CLI 구현 |
-|------|------------------|----------|
-| **자산 (Asset)** | 계정 잔고 조회 | 없음 → `upbit account balance` 등 필요 |
-| **주문 (Order)** | 주문 생성, 주문 생성 테스트, 개별/지정/일괄 취소, 주문 가능 정보, 개별 주문 조회, 주문 목록, 체결 대기/종료 주문 조회 | 없음 → `upbit order place`, `upbit order list`, `upbit order cancel` 등 필요 |
-| **출금 (Withdrawal)** | 디지털/원화 출금, 출금 취소, 출금 가능 정보, 출금 허용 주소, 개별/목록 조회 | 없음 |
-| **입금 (Deposit)** | 입금 주소 생성/조회/목록, 입금 가능 통화, 개별/목록 입금 조회, 트래블룰, 원화 입금 | 없음 |
-| **서비스 정보 (Service)** | 입출금 서비스 상태, API Key 목록 조회 | 없음 |
-
----
-
-## 4. WebSocket
-
-업비트는 시세/호가/체결/계정/주문 등에 대한 **WebSocket**도 제공합니다.  
-현재 upbit_cli는 **REST만** 사용하며, WebSocket 구독·스트림 기능은 없습니다.
+| 기능 | 메서드/경로 | CLI 커맨드 | 상태 |
+|------|-------------|------------|------|
+| 자산 조회 | GET /accounts | `account balance` | ✅ |
+| 주문 가능 정보 | GET /orders/chance | `order chance` | ✅ |
+| 주문 생성 | POST /orders | `order place` | ✅ |
+| 주문 목록/단건 | GET /orders, GET /order | `order list`, `order get` | ✅ |
+| 주문 취소 | DELETE /order | `order cancel`, `order cancel-all` | ✅ |
+| 입금 목록/단건 | GET /deposits, GET /deposit | `deposit list`, `deposit get` | ✅ |
+| 입금 주소 생성 | POST /deposits/generate_coin_address | `deposit generate-address` | ✅ |
+| 출금 목록/단건 | GET /withdraws, GET /withdraw | `withdraw list`, `withdraw get` | ✅ |
+| 원화 출금 | POST /withdraws/krw | `withdraw krw` | ✅ |
+| 디지털 자산 출금 | POST /withdraws/coin | `withdraw coin` | ✅ |
+| 입출금 상태 / API Key | GET /status/wallet, GET /api_keys | `service wallet-status`, `service api-keys` | ✅ |
+| **원화 입금** | **POST /deposits/krw** | — | ❌ 미구현 |
+| **디지털 자산 출금 취소** | **DELETE /withdraws/coin** | — | ❌ 미구현 |
 
 ---
 
-## 5. 정리 및 권장 작업
+## 2. WebSocket — 전부 구현됨
 
-- **이미 구현된 것**: 현재가(ticker), 호가(orderbook), 캔들(초/분/일/주/월), 마켓 목록(list-markets, --quote 필터), 최근 체결(get-trades, sequential_id·--cursor), 호가 정책(get-orderbook-instruments), 인증 설정(`upbit configure`), JWT 생성 준비.  
-  - AI 에이전트용: `--to` ISO 8601, 캔들/체결 limit 상한(200/500), TradeCompact.sequential_id 필수.
-- **거래/자산 쪽**: 계정 잔고 → `upbit account balance`, 주문 생성/조회/취소 → `upbit order ...` 등 새 명령 그룹으로 구현 필요.
+| 타입 | CLI 커맨드 | 비고 |
+|------|------------|------|
+| ticker | `stream ticker` | ✅ |
+| orderbook | `stream orderbook` | ✅ |
+| trade | `stream trade` | ✅ |
+| candle.{unit} | `stream candle --unit 1m` 등 | ✅ 1s,1m,3m,5m,10m,15m,30m,60m,240m,1d,1w,1M |
+| myOrder | `stream my-order` | ✅ (Private) |
+| myAsset | `stream my-asset` | ✅ (Private) |
 
-이 문서는 업비트 API 문서를 기준으로 작성되었으며, 엔드포인트 경로·옵션은 업비트 개발자 문서 최신 버전을 반드시 확인하는 것을 권장합니다.
+---
+
+## 3. 미구현 REST 2종 (추가 시 고려)
+
+1. **POST /deposits/krw** — 원화 입금 요청  
+   - 파라미터: `amount`, `two_factor_type` (kakao/naver/hana)  
+   - 2채널 인증 필요.
+
+2. **DELETE /withdraws/coin** — 디지털 자산 출금 취소  
+   - 파라미터: `uuid` (출금 UUID)  
+   - 취소 가능 상태(`is_cancelable`)인 경우만 가능.
+
+---
+
+## 4. 요약
+
+- **REST:** 시세·거래·입출금 조회 및 실행 대부분 구현. 미구현 2건: 원화 입금(POST /deposits/krw), 출금 취소(DELETE /withdraws/coin).
+- **WebSocket:** 시세(ticker, orderbook, trade, candle) 및 Private(myOrder, myAsset) 모두 구현됨.

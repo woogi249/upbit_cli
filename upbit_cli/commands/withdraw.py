@@ -1,5 +1,5 @@
 """
-Withdrawal commands: list, get, krw, coin.
+Withdrawal commands: list, get, krw, coin, cancel-coin.
 
 Requires JWT. Compact keeps currency, amount (string), state, txid, uuid.
 Withdrawal APIs use no-retry to avoid double-withdrawals. KRW success includes 2FA hint for agents.
@@ -315,6 +315,36 @@ def withdraw_coin(
         )
     except ValueError as e:
         _print_error_stderr("VALIDATION_ERROR", str(e), exit_code=1)
+    except AuthError as e:
+        _print_error_stderr(e.error_code, e.message, exit_code=e.exit_code, suggested_action="terminate_and_ask_human")
+    except UpbitAPIError as e:
+        _print_error_stderr(e.error_code, e.message, status_code=e.status_code, details=e.details, exit_code=e.exit_code)
+    except Exception as e:
+        _print_error_stderr("UNEXPECTED_ERROR", str(e), exit_code=1)
+
+
+async def _cancel_coin_impl(uuid_str: str) -> None:
+    creds = get_credentials()
+    if creds is None:
+        raise AuthError(message="Missing API credentials.")
+    raw_json = await request_json_private(
+        "DELETE",
+        "/withdraws/coin",
+        credentials=creds,
+        params={"uuid": uuid_str},
+        allow_retry=False,
+    )
+    _print_success_stdout(raw_json)
+
+
+@withdraw_app.command("cancel-coin")
+def cancel_coin(
+    ctx: typer.Context,
+    uuid: str = typer.Option(..., "--uuid", help="Withdrawal UUID to cancel (must be a coin withdrawal)."),
+) -> None:
+    """Cancel a digital asset withdrawal. Only withdrawals with is_cancelable true can be cancelled. Use withdraw get/list to check is_cancelable."""
+    try:
+        asyncio.run(_cancel_coin_impl(uuid))
     except AuthError as e:
         _print_error_stderr(e.error_code, e.message, exit_code=e.exit_code, suggested_action="terminate_and_ask_human")
     except UpbitAPIError as e:

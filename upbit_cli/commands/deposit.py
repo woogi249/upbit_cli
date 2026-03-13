@@ -1,8 +1,9 @@
 """
-Deposit commands: list, get, generate-address.
+Deposit commands: list, get, generate-address, krw.
 
 Requires JWT. Compact keeps currency, amount (string), state, txid, uuid.
 Generate-address returns status 'generating' with suggested_action when address is not yet ready.
+KRW deposit uses allow_retry=False and injects suggested_action for 2FA.
 """
 
 from __future__ import annotations
@@ -60,8 +61,11 @@ class DepositCompact(BaseModel):
         )
 
 
-def _print_success_stdout(data: Any) -> None:
-    print(json.dumps({"success": True, "data": data}, ensure_ascii=False, separators=(",", ":")))
+def _print_success_stdout(data: Any, suggested_action: Optional[str] = None) -> None:
+    payload: dict = {"success": True, "data": data}
+    if suggested_action is not None:
+        payload["suggested_action"] = suggested_action
+    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
 
 def _print_error_stderr(
@@ -214,6 +218,48 @@ def generate_address(
     """Request generation of a deposit address. If address is not ready, returns status 'generating' and suggested_action."""
     try:
         asyncio.run(_generate_address_impl(currency=currency, net_type=net_type))
+    except AuthError as e:
+        _print_error_stderr(e.error_code, e.message, exit_code=e.exit_code, suggested_action="terminate_and_ask_human")
+    except UpbitAPIError as e:
+        _print_error_stderr(e.error_code, e.message, status_code=e.status_code, details=e.details, exit_code=e.exit_code)
+    except Exception as e:
+        _print_error_stderr("UNEXPECTED_ERROR", str(e), exit_code=1)
+
+
+async def _deposit_krw_impl(amount: str, two_factor_type: str) -> None:
+    creds = get_credentials()
+    if creds is None:
+        raise AuthError(message="Missing API credentials.")
+    raw_json = await request_json_private(
+        "POST",
+        "/deposits/krw",
+        credentials=creds,
+        json_body={"amount": amount, "two_factor_type": two_factor_type},
+        allow_retry=False,
+    )
+    _print_success_stdout(raw_json, suggested_action="await_human_2fa_approval")
+
+
+@deposit_app.command("krw")
+def deposit_krw(
+    ctx: typer.Context,
+    amount: str = typer.Option(..., "--amount", "-a", help="Deposit amount in KRW (e.g. 10000)."),
+    two_factor_type: str = typer.Option(
+        ...,
+        "--two-factor-type",
+        "-t",
+        help="2FA channel: kakao, naver, or hana. Human must approve in app.",
+    ),
+) -> None:
+    """Request KRW deposit. No retries; 2FA must be approved by human. Success includes suggested_action for agents."""
+    if two_factor_type not in ("kakao", "naver", "hana"):
+        _print_error_stderr(
+            "VALIDATION_ERROR",
+            "two_factor_type must be one of: kakao, naver, hana.",
+            exit_code=1,
+        )
+    try:
+        asyncio.run(_deposit_krw_impl(amount=amount, two_factor_type=two_factor_type))
     except AuthError as e:
         _print_error_stderr(e.error_code, e.message, exit_code=e.exit_code, suggested_action="terminate_and_ask_human")
     except UpbitAPIError as e:
