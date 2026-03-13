@@ -12,16 +12,18 @@ import json
 import sys
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 import typer
 
 from upbit_cli.commands.account import account_app
+from upbit_cli.commands.agent import agent_app, _ai_help_content
 from upbit_cli.commands.configure import configure_app
 from upbit_cli.commands.deposit import deposit_app
 from upbit_cli.commands.market import market_app
 from upbit_cli.commands.order import order_app
 from upbit_cli.commands.service import service_app
+from upbit_cli.commands.stream import stream_app
 from upbit_cli.commands.withdraw import withdraw_app
 from upbit_cli.http_client import UpbitAPIError
 
@@ -53,8 +55,10 @@ def _print_error_stderr(
     *,
     status_code: Optional[int] = None,
     details: Optional[dict] = None,
+    suggested_action: Optional[str] = None,
+    retry_after_sec: Optional[int] = None,
 ) -> None:
-    """Print standardized error envelope to stderr. Caller must then raise typer.Exit(code)."""
+    """Print standardized error envelope to stderr. suggested_action helps agents recover."""
     payload: dict[str, Any] = {
         "success": False,
         "error_code": error_code,
@@ -64,6 +68,10 @@ def _print_error_stderr(
         payload["status_code"] = status_code
     if details:
         payload["details"] = details
+    if suggested_action:
+        payload["suggested_action"] = suggested_action
+    if retry_after_sec is not None:
+        payload["retry_after_sec"] = retry_after_sec
     print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), file=sys.stderr)
 
 
@@ -89,8 +97,16 @@ def global_callback(
         "-v",
         help="Emit extra logs to stderr (never to stdout).",
     ),
+    ai_help: bool = typer.Option(
+        False,
+        "--ai-help",
+        help="Print token-optimized CLI usage as JSON for LLM agents, then exit.",
+    ),
 ) -> None:
     """Global options applied to all commands. When output is json, stdout is strictly JSON only."""
+    if ai_help:
+        print(_ai_help_content())
+        raise typer.Exit(0)
     ctx.obj = AppConfig(output=output, verbose=verbose)
 
 
@@ -100,7 +116,22 @@ app.add_typer(order_app, name="order", help="Orders: place, list, cancel (requir
 app.add_typer(deposit_app, name="deposit", help="Deposits: list, get (requires API credentials).")
 app.add_typer(withdraw_app, name="withdraw", help="Withdrawals: list, get (requires API credentials).")
 app.add_typer(service_app, name="service", help="Service info: wallet status, API keys (requires API credentials).")
+app.add_typer(stream_app, name="stream", help="Real-time WebSocket streams (NDJSON to stdout).")
+app.add_typer(agent_app, name="agent", help="Agent integration: schema export, ai-help, MCP.")
 app.add_typer(configure_app, name="configure", help="Save API credentials to ~/.upbit/config.json.")
+
+
+def _suggested_action_for_error(error_code: str, details: Optional[dict]) -> Tuple[Optional[str], Optional[int]]:
+    """Return (suggested_action, retry_after_sec) for agent recovery."""
+    if error_code == "HTTP_429":
+        return "sleep_and_retry", 5
+    if error_code == "AUTH_ERROR":
+        return "terminate_and_ask_human", None
+    if details and ("market" in str(details).lower() or "INVALID" in error_code):
+        return "check_market_list_command", None
+    if "NETWORK" in error_code or "Connection" in str(details or ""):
+        return "retry_after_delay", 2
+    return "retry_or_check_docs", None
 
 
 def main() -> None:
@@ -110,13 +141,22 @@ def main() -> None:
     except typer.Exit as e:
         raise
     except UpbitAPIError as e:
+        details = e.details if e.details else None
+        action, retry_sec = _suggested_action_for_error(e.error_code, details)
         _print_error_stderr(
             e.error_code,
             e.message,
             status_code=e.status_code,
-            details=e.details if e.details else None,
+            details=details,
+            suggested_action=action,
+            retry_after_sec=retry_sec,
         )
         raise typer.Exit(e.exit_code)
     except Exception as e:
-        _print_error_stderr("UNEXPECTED_ERROR", str(e), details={})
+        _print_error_stderr(
+            "UNEXPECTED_ERROR",
+            str(e),
+            details={},
+            suggested_action="terminate_and_ask_human",
+        )
         raise typer.Exit(1)
