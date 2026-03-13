@@ -79,6 +79,38 @@ def _sample_candles_payload() -> List[Dict[str, Any]]:
     ]
 
 
+def _sample_markets_payload() -> List[Dict[str, Any]]:
+    """Minimal valid Upbit market/all response."""
+    return [
+        {"market": "KRW-BTC", "korean_name": "비트코인", "english_name": "Bitcoin"},
+        {"market": "KRW-ETH", "korean_name": "이더리움", "english_name": "Ethereum"},
+        {"market": "USDT-BTC", "korean_name": "비트코인", "english_name": "Bitcoin"},
+    ]
+
+
+def _sample_trades_payload() -> List[Dict[str, Any]]:
+    """Minimal valid Upbit trades/ticks response (sequential_id required for pagination)."""
+    return [
+        {
+            "market": "KRW-BTC",
+            "trade_date_utc": "2024-03-13",
+            "trade_time_utc": "12:00:00",
+            "timestamp": 1710000000000,
+            "trade_price": 100500000.0,
+            "trade_volume": 0.001,
+            "sequential_id": 1000001,
+            "ask_bid": "BID",
+        },
+    ]
+
+
+def _sample_orderbook_instruments_payload() -> List[Dict[str, Any]]:
+    """Minimal valid Upbit orderbook/instruments response."""
+    return [
+        {"market": "KRW-BTC", "quote_currency": "KRW", "tick_size": 1000.0, "supported_levels": [0]},
+    ]
+
+
 @pytest.fixture
 def sample_ticker_response() -> List[Dict[str, Any]]:
     """Raw ticker JSON as returned by Upbit API (one market)."""
@@ -95,6 +127,24 @@ def sample_orderbook_response() -> List[Dict[str, Any]]:
 def sample_candles_response() -> List[Dict[str, Any]]:
     """Raw candles JSON as returned by Upbit API."""
     return _sample_candles_payload()
+
+
+@pytest.fixture
+def sample_markets_response() -> List[Dict[str, Any]]:
+    """Raw market list JSON as returned by Upbit API (GET /market/all)."""
+    return _sample_markets_payload()
+
+
+@pytest.fixture
+def sample_trades_response() -> List[Dict[str, Any]]:
+    """Raw trades JSON as returned by Upbit API (GET /trades/ticks), includes sequential_id."""
+    return _sample_trades_payload()
+
+
+@pytest.fixture
+def sample_orderbook_instruments_response() -> List[Dict[str, Any]]:
+    """Raw orderbook instruments JSON as returned by Upbit API."""
+    return _sample_orderbook_instruments_payload()
 
 
 @pytest.fixture

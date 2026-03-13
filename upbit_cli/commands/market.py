@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, List, Optional
 
@@ -21,6 +22,29 @@ from rich.table import Table
 from upbit_cli.http_client import UpbitAPIError, request_json
 
 market_app = typer.Typer(help="Market data: tickers, orderbooks, candles.")
+
+# Upbit API hard limits (clamp to avoid HTTP 400)
+CANDLES_MAX_COUNT = 200
+TRADES_MAX_COUNT = 500
+
+
+def _parse_iso8601_to_upbit(iso_str: str, for_trades: bool) -> str:
+    """
+    Parse ISO 8601 datetime string and convert to Upbit API format.
+    - for_trades=True: returns HHmmss (e.g. 215837) for the 'to' parameter.
+    - for_trades=False: returns yyyy-MM-dd HH:mm:ss for candles 'to' parameter.
+    """
+    s = iso_str.strip().replace("Z", "+00:00")
+    if len(s) >= 19 and s[10] == "T":
+        dt = datetime.fromisoformat(s[:19])
+    else:
+        dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    if for_trades:
+        return dt.strftime("%H%M%S")
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
 
 # ---------- Ticker models ----------
 
@@ -207,6 +231,135 @@ class CandleCompact(BaseModel):
         )
 
 
+# ---------- Market list models (GET /market/all) ----------
+
+
+class MarketInfoRaw(BaseModel):
+    """Raw market info from GET /v1/market/all."""
+
+    model_config = ConfigDict(extra="ignore", arbitrary_types_allowed=False)
+
+    market: str
+    korean_name: Optional[str] = None
+    english_name: Optional[str] = None
+    market_warning: Optional[str] = None
+
+
+class MarketInfoCompact(BaseModel):
+    """Minimal market info for AI agents."""
+
+    model_config = ConfigDict(extra="ignore", arbitrary_types_allowed=False)
+
+    market: str
+    korean_name: Optional[str] = None
+    english_name: Optional[str] = None
+
+    @classmethod
+    def from_raw(cls, raw: MarketInfoRaw) -> MarketInfoCompact:
+        return cls(
+            market=raw.market,
+            korean_name=raw.korean_name,
+            english_name=raw.english_name,
+        )
+
+
+# ---------- Trade models (GET /trades/ticks) ----------
+
+
+class TradeRaw(BaseModel):
+    """Raw trade tick from GET /v1/trades/ticks."""
+
+    model_config = ConfigDict(extra="ignore", arbitrary_types_allowed=False)
+
+    market: str
+    trade_date_utc: Optional[str] = None
+    trade_time_utc: Optional[str] = None
+    timestamp: int
+    trade_price: Decimal
+    trade_volume: Decimal
+    sequential_id: int
+    ask_bid: str
+    prev_closing_price: Optional[Decimal] = None
+
+    @field_serializer("trade_price", "trade_volume", "prev_closing_price", when_used="json")
+    def _ser_decimal(self, value: Optional[Decimal]) -> str:
+        if value is None:
+            return "0"
+        return format(value, "f")
+
+
+class TradeCompact(BaseModel):
+    """Minimal trade for AI agents. sequential_id is required for pagination (use as --cursor for next call)."""
+
+    model_config = ConfigDict(extra="ignore", arbitrary_types_allowed=False)
+
+    market: str
+    timestamp: int
+    trade_price: Decimal
+    trade_volume: Decimal
+    sequential_id: int
+    ask_bid: str
+
+    @field_serializer("trade_price", "trade_volume", when_used="json")
+    def _ser_decimal(self, value: Decimal) -> str:
+        return format(value, "f")
+
+    @classmethod
+    def from_raw(cls, raw: TradeRaw) -> TradeCompact:
+        return cls(
+            market=raw.market,
+            timestamp=raw.timestamp,
+            trade_price=raw.trade_price,
+            trade_volume=raw.trade_volume,
+            sequential_id=raw.sequential_id,
+            ask_bid=raw.ask_bid,
+        )
+
+
+# ---------- Orderbook instruments (GET /orderbook/instruments) ----------
+
+
+class OrderbookInstrumentRaw(BaseModel):
+    """Raw orderbook instrument from GET /v1/orderbook/instruments."""
+
+    model_config = ConfigDict(extra="ignore", arbitrary_types_allowed=False)
+
+    market: str
+    quote_currency: Optional[str] = None
+    tick_size: Optional[Decimal] = None
+    supported_levels: Optional[List[int]] = None
+
+    @field_serializer("tick_size", when_used="json")
+    def _ser_decimal(self, value: Optional[Decimal]) -> str:
+        if value is None:
+            return "0"
+        return format(value, "f")
+
+
+class OrderbookInstrumentCompact(BaseModel):
+    """Minimal orderbook instrument for AI agents."""
+
+    model_config = ConfigDict(extra="ignore", arbitrary_types_allowed=False)
+
+    market: str
+    quote_currency: Optional[str] = None
+    tick_size: Optional[Decimal] = None
+
+    @field_serializer("tick_size", when_used="json")
+    def _ser_decimal(self, value: Optional[Decimal]) -> str:
+        if value is None:
+            return "0"
+        return format(value, "f")
+
+    @classmethod
+    def from_raw(cls, raw: OrderbookInstrumentRaw) -> OrderbookInstrumentCompact:
+        return cls(
+            market=raw.market,
+            quote_currency=raw.quote_currency,
+            tick_size=raw.tick_size,
+        )
+
+
 # ---------- Output helpers (stdout / stderr) ----------
 
 
@@ -287,6 +440,90 @@ def _print_error_stderr(
     print(err_str, file=sys.stderr)
     sys.stderr.flush()
     raise typer.Exit(code=exit_code)
+
+
+# ---------- List markets command ----------
+
+
+async def _list_markets_impl(
+    details: bool,
+    quote: Optional[str],
+    limit: int,
+    compact: bool,
+    use_rich: bool = False,
+) -> None:
+    params: dict = {}
+    if details:
+        params["is_details"] = "true"
+    raw_json = await request_json("GET", "/market/all", params=params or None)
+    if not isinstance(raw_json, list):
+        raise UpbitAPIError(
+            error_code="INVALID_RESPONSE",
+            message="Market list response was not a list.",
+            details={"raw": raw_json},
+        )
+    markets_raw: List[MarketInfoRaw] = [MarketInfoRaw.model_validate(item) for item in raw_json]
+    if quote is not None:
+        prefix = f"{quote}-"
+        markets_raw = [m for m in markets_raw if m.market.startswith(prefix)]
+    markets_raw = markets_raw[:limit]
+    if compact:
+        out = [MarketInfoCompact.from_raw(m).model_dump(mode="json") for m in markets_raw]
+    else:
+        out = [m.model_dump(mode="json") for m in markets_raw]
+    if use_rich:
+        _print_rich_ticker(out)
+    else:
+        _print_success_stdout(out)
+
+
+@market_app.command("list-markets")
+def list_markets(
+    ctx: typer.Context,
+    details: bool = typer.Option(
+        False,
+        "--details/--no-details",
+        help="Include extra fields (market_warning etc.).",
+    ),
+    quote: Optional[str] = typer.Option(
+        None,
+        "--quote",
+        "-q",
+        help="Filter by quote currency: only markets starting with QUOTE- (e.g. KRW, USDT, BTC). Applied before --limit.",
+    ),
+    limit: int = typer.Option(
+        50,
+        "--limit",
+        "-l",
+        help="Max number of markets to return after optional --quote filter (default 50).",
+    ),
+    compact: bool = typer.Option(
+        True,
+        "--compact/--no-compact",
+        help="Return compact JSON for AI agents (default: compact).",
+    ),
+) -> None:
+    """List all markets. Use --quote KRW to get only fiat-quoted markets before applying --limit."""
+    try:
+        asyncio.run(
+            _list_markets_impl(
+                details=details,
+                quote=quote,
+                limit=limit,
+                compact=compact,
+                use_rich=_is_rich(ctx),
+            )
+        )
+    except UpbitAPIError as exc:
+        _print_error_stderr(
+            exc.error_code,
+            exc.message,
+            status_code=exc.status_code,
+            details=exc.details if exc.details else None,
+            exit_code=exc.exit_code,
+        )
+    except Exception as exc:
+        _print_error_stderr("UNEXPECTED_ERROR", str(exc), exit_code=1)
 
 
 # ---------- Ticker command ----------
@@ -392,6 +629,164 @@ def get_orderbook(
         _print_error_stderr("UNEXPECTED_ERROR", str(exc), exit_code=1)
 
 
+# ---------- Orderbook instruments command ----------
+
+
+async def _get_orderbook_instruments_impl(
+    markets: str,
+    compact: bool,
+    use_rich: bool = False,
+) -> None:
+    raw_json = await request_json("GET", "/orderbook/instruments", params={"markets": markets})
+    if not isinstance(raw_json, list):
+        raise UpbitAPIError(
+            error_code="INVALID_RESPONSE",
+            message="Orderbook instruments response was not a list.",
+            details={"raw": raw_json},
+        )
+    instruments_raw: List[OrderbookInstrumentRaw] = [
+        OrderbookInstrumentRaw.model_validate(item) for item in raw_json
+    ]
+    if compact:
+        out = [OrderbookInstrumentCompact.from_raw(i).model_dump(mode="json") for i in instruments_raw]
+    else:
+        out = [i.model_dump(mode="json") for i in instruments_raw]
+    if use_rich:
+        _print_rich_ticker(out)
+    else:
+        _print_success_stdout(out)
+
+
+@market_app.command("get-orderbook-instruments")
+def get_orderbook_instruments(
+    ctx: typer.Context,
+    markets: str = typer.Option(
+        ...,
+        "--markets",
+        "-m",
+        help="Comma-separated market symbols, e.g. KRW-BTC,KRW-ETH.",
+    ),
+    compact: bool = typer.Option(
+        True,
+        "--compact/--no-compact",
+        help="Return compact JSON for AI agents (default: compact).",
+    ),
+) -> None:
+    """Get orderbook policy (tick size, etc.) for given markets."""
+    try:
+        asyncio.run(
+            _get_orderbook_instruments_impl(
+                markets=markets,
+                compact=compact,
+                use_rich=_is_rich(ctx),
+            )
+        )
+    except UpbitAPIError as exc:
+        _print_error_stderr(
+            exc.error_code,
+            exc.message,
+            status_code=exc.status_code,
+            details=exc.details if exc.details else None,
+            exit_code=exc.exit_code,
+        )
+    except Exception as exc:
+        _print_error_stderr("UNEXPECTED_ERROR", str(exc), exit_code=1)
+
+
+# ---------- Trades command ----------
+
+
+async def _get_trades_impl(
+    market: str,
+    limit: int,
+    days_ago: Optional[int],
+    to_iso: Optional[str],
+    cursor: Optional[str],
+    compact: bool,
+    use_rich: bool = False,
+) -> None:
+    effective_limit = min(limit, TRADES_MAX_COUNT)
+    params: dict = {"market": market, "count": effective_limit}
+    if days_ago is not None:
+        params["days_ago"] = days_ago
+    if to_iso:
+        params["to"] = _parse_iso8601_to_upbit(to_iso, for_trades=True)
+    if cursor is not None:
+        params["cursor"] = cursor
+    raw_json = await request_json("GET", "/trades/ticks", params=params)
+    if not isinstance(raw_json, list):
+        raise UpbitAPIError(
+            error_code="INVALID_RESPONSE",
+            message="Trades response was not a list.",
+            details={"raw": raw_json},
+        )
+    trades_raw: List[TradeRaw] = [TradeRaw.model_validate(item) for item in raw_json]
+    if compact:
+        out = [TradeCompact.from_raw(t).model_dump(mode="json") for t in trades_raw]
+    else:
+        out = [t.model_dump(mode="json") for t in trades_raw]
+    if use_rich:
+        _print_rich_ticker(out)
+    else:
+        _print_success_stdout(out)
+
+
+@market_app.command("get-trades")
+def get_trades(
+    ctx: typer.Context,
+    market: str = typer.Option(..., "--market", "-m", help="Market symbol, e.g. KRW-BTC."),
+    limit: int = typer.Option(
+        10,
+        "--limit",
+        "-l",
+        help="Number of trades (capped at 500 by API, default 10).",
+    ),
+    days_ago: Optional[int] = typer.Option(
+        None,
+        "--days-ago",
+        help="Optional days ago for time range.",
+    ),
+    to: Optional[str] = typer.Option(
+        None,
+        "--to",
+        help="End time in ISO 8601 format (e.g. 2026-03-13T21:58:37). Converted to Upbit format internally.",
+    ),
+    cursor: Optional[str] = typer.Option(
+        None,
+        "--cursor",
+        help="Pagination cursor: use the last sequential_id from the previous response for the next call.",
+    ),
+    compact: bool = typer.Option(
+        True,
+        "--compact/--no-compact",
+        help="Return compact JSON including sequential_id for pagination (default: compact).",
+    ),
+) -> None:
+    """Get recent trades. Use the last sequential_id from the response as --cursor for the next call. --limit capped at 500."""
+    try:
+        asyncio.run(
+            _get_trades_impl(
+                market=market,
+                limit=limit,
+                days_ago=days_ago,
+                to_iso=to,
+                cursor=cursor,
+                compact=compact,
+                use_rich=_is_rich(ctx),
+            )
+        )
+    except UpbitAPIError as exc:
+        _print_error_stderr(
+            exc.error_code,
+            exc.message,
+            status_code=exc.status_code,
+            details=exc.details if exc.details else None,
+            exit_code=exc.exit_code,
+        )
+    except Exception as exc:
+        _print_error_stderr("UNEXPECTED_ERROR", str(exc), exit_code=1)
+
+
 # ---------- Candles command ----------
 
 
@@ -400,15 +795,26 @@ async def _get_candles_impl(
     unit: str,
     interval: Optional[int],
     limit: int,
+    to_iso: Optional[str],
     compact: bool,
     use_rich: bool = False,
 ) -> None:
-    if unit == "minutes":
-        path = f"/candles/minutes/{interval}"
-        params: dict = {"market": market, "count": limit}
+    effective_limit = min(limit, CANDLES_MAX_COUNT)
+    params: dict = {"market": market, "count": effective_limit}
+    if to_iso:
+        params["to"] = _parse_iso8601_to_upbit(to_iso, for_trades=False)
+    if unit == "seconds":
+        path = f"/candles/seconds/{interval or 1}"
+    elif unit == "minutes":
+        path = f"/candles/minutes/{interval or 1}"
+    elif unit == "days":
+        path = "/candles/days"
+    elif unit == "weeks":
+        path = "/candles/weeks"
+    elif unit == "months":
+        path = "/candles/months"
     else:
         path = "/candles/days"
-        params = {"market": market, "count": limit}
     raw_json = await request_json("GET", path, params=params)
     if not isinstance(raw_json, list):
         raise UpbitAPIError(
@@ -435,19 +841,24 @@ def get_candles(
         "minutes",
         "--unit",
         "-u",
-        help="Candle type: 'minutes' or 'days'.",
+        help="Candle type: 'seconds', 'minutes', 'days', 'weeks', or 'months'.",
     ),
     interval: Optional[int] = typer.Option(
         1,
         "--interval",
         "-i",
-        help="Minute interval when unit is minutes (e.g. 1, 3, 5).",
+        help="Interval when unit is seconds or minutes (e.g. 1, 3, 5).",
     ),
     limit: int = typer.Option(
         5,
         "--limit",
         "-l",
-        help="Number of candles (API count parameter, default 5).",
+        help="Number of candles (capped at 200 by API, default 5).",
+    ),
+    to: Optional[str] = typer.Option(
+        None,
+        "--to",
+        help="End time in ISO 8601 format (e.g. 2026-03-13T21:58:37). Converted to Upbit format internally.",
     ),
     compact: bool = typer.Option(
         True,
@@ -455,11 +866,25 @@ def get_candles(
         help="Return only essential OHLCV fields (default: compact).",
     ),
 ) -> None:
-    """Get candles (minutes or days). --limit is passed to API as count."""
-    if unit not in ("minutes", "days"):
-        _print_error_stderr("VALIDATION_ERROR", "unit must be 'minutes' or 'days'", exit_code=1)
+    """Get candles (seconds, minutes, days, weeks, months). --limit is capped at 200. --to accepts ISO 8601."""
+    if unit not in ("seconds", "minutes", "days", "weeks", "months"):
+        _print_error_stderr(
+            "VALIDATION_ERROR",
+            "unit must be one of: seconds, minutes, days, weeks, months",
+            exit_code=1,
+        )
     try:
-        asyncio.run(_get_candles_impl(market=market, unit=unit, interval=interval, limit=limit, compact=compact, use_rich=_is_rich(ctx)))
+        asyncio.run(
+            _get_candles_impl(
+                market=market,
+                unit=unit,
+                interval=interval,
+                limit=limit,
+                to_iso=to,
+                compact=compact,
+                use_rich=_is_rich(ctx),
+            )
+        )
     except UpbitAPIError as exc:
         _print_error_stderr(
             exc.error_code,

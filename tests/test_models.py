@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from decimal import Decimal
 
-from upbit_cli.commands.market import TickerCompact, TickerRaw
+from upbit_cli.commands.market import TickerCompact, TickerRaw, TradeCompact, TradeRaw
 
 
 
@@ -89,3 +89,36 @@ class TestDecimalSerialization:
         assert isinstance(parsed["acc_trade_price_24h"], str)
         assert isinstance(parsed["acc_trade_volume_24h"], str)
         assert "100500000" in parsed["trade_price"] or parsed["trade_price"] == "100500000.0"
+
+
+def _raw_trade_dict() -> dict:
+    """Minimal dict that validates as TradeRaw (Upbit trades/ticks subset)."""
+    return {
+        "market": "KRW-BTC",
+        "trade_date_utc": "2024-03-13",
+        "trade_time_utc": "12:00:00",
+        "timestamp": 1710000000000,
+        "trade_price": 100500000.0,
+        "trade_volume": 0.001,
+        "sequential_id": 1000001,
+        "ask_bid": "BID",
+    }
+
+
+class TestTradeCompactSequentialId:
+    """TradeCompact must include sequential_id for pagination (--cursor)."""
+
+    def test_compact_includes_sequential_id(self) -> None:
+        raw = TradeRaw.model_validate(_raw_trade_dict())
+        compact = TradeCompact.from_raw(raw)
+        assert hasattr(compact, "sequential_id")
+        assert compact.sequential_id == 1000001
+
+    def test_compact_json_serializes_sequential_id(self) -> None:
+        raw = TradeRaw.model_validate(_raw_trade_dict())
+        compact = TradeCompact.from_raw(raw)
+        dumped = compact.model_dump(mode="json")
+        assert "sequential_id" in dumped
+        assert dumped["sequential_id"] == 1000001
+        assert isinstance(dumped["trade_price"], str)
+        assert isinstance(dumped["trade_volume"], str)
