@@ -4,12 +4,15 @@ HTTP client for Upbit API: async httpx with tenacity backoff and standardized er
 - Base URL: https://api.upbit.com/v1
 - No real requests in tests: mock via respx.
 - Retries on 429 and 5xx with exponential backoff.
+- Private API: request_json_private with JWT and SHA512 query/body hash.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any, Dict, Optional
+from urllib.parse import urlencode
 
 import httpx
 from tenacity import (
@@ -103,18 +106,27 @@ async def _do_request(
     *,
     params: Optional[Dict[str, Any]] = None,
     headers: Optional[Dict[str, str]] = None,
+    json_body: Optional[Dict[str, Any]] = None,
     timeout: float = 10.0,
 ) -> Any:
     """Single HTTP request; raises RetryableUpbitError, UpbitAPIError, or NetworkError."""
     url = f"{BASE_URL}{path}"
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.request(
-                method=method.upper(),
-                url=url,
-                params=params,
-                headers=headers,
-            )
+            if json_body is not None:
+                response = await client.request(
+                    method=method.upper(),
+                    url=url,
+                    headers=headers,
+                    json=json_body,
+                )
+            else:
+                response = await client.request(
+                    method=method.upper(),
+                    url=url,
+                    params=params,
+                    headers=headers,
+                )
     except httpx.RequestError as exc:
         raise NetworkError(
             message=f"Network error: {exc.request.url!s}",
@@ -178,6 +190,74 @@ async def request_json(
         reraise=True,
     ):
         with attempt:
+            return await _do_request(
+                method=method,
+                path=path,
+                params=params,
+                headers=headers,
+                timeout=timeout,
+            )
+    return None  # unreachable
+
+
+def _compute_query_hash_for_get(params: Optional[Dict[str, Any]]) -> str:
+    """Compute SHA512 hex digest of query string for GET (Upbit private API)."""
+    if not params:
+        return hashlib.sha512(b"").hexdigest()
+    qs = urlencode(sorted(params.items()))
+    return hashlib.sha512(qs.encode()).hexdigest()
+
+
+def _compute_query_hash_for_body(json_body: Optional[Dict[str, Any]]) -> str:
+    """Compute SHA512 hex digest of JSON body for POST/DELETE (Upbit private API)."""
+    body_str = json.dumps(json_body or {}, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha512(body_str.encode()).hexdigest()
+
+
+async def request_json_private(
+    method: str,
+    path: str,
+    credentials: Any,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+    json_body: Optional[Dict[str, Any]] = None,
+    timeout: float = 10.0,
+) -> Any:
+    """
+    Perform authenticated JSON request to Upbit private API.
+
+    JWT is built with query_hash: for GET, hash of query string; for POST/DELETE, hash of JSON body.
+    Raises AuthError if credentials is None. Uses same retry logic as request_json.
+    """
+    from upbit_cli.auth import JWTOptions, generate_jwt
+
+    if credentials is None:
+        raise AuthError(
+            message="Missing API credentials. Set UPBIT_ACCESS_KEY and UPBIT_SECRET_KEY or run 'upbit configure'.",
+        )
+    method_upper = method.upper()
+    if method_upper == "GET":
+        query_hash = _compute_query_hash_for_get(params)
+    else:
+        query_hash = _compute_query_hash_for_body(json_body)
+    options = JWTOptions(query_hash=query_hash, query_hash_alg="SHA512")
+    token = generate_jwt(credentials, options)
+    headers = {"Authorization": f"Bearer {token}"}
+    async for attempt in AsyncRetrying(
+        retry=retry_if_exception_type(RetryableUpbitError),
+        wait=wait_exponential(multiplier=0.5, min=0.5, max=5),
+        stop=stop_after_attempt(5),
+        reraise=True,
+    ):
+        with attempt:
+            if json_body is not None:
+                return await _do_request(
+                    method=method,
+                    path=path,
+                    headers=headers,
+                    json_body=json_body,
+                    timeout=timeout,
+                )
             return await _do_request(
                 method=method,
                 path=path,

@@ -16,8 +16,13 @@ from typing import Any, Optional
 
 import typer
 
+from upbit_cli.commands.account import account_app
 from upbit_cli.commands.configure import configure_app
+from upbit_cli.commands.deposit import deposit_app
 from upbit_cli.commands.market import market_app
+from upbit_cli.commands.order import order_app
+from upbit_cli.commands.service import service_app
+from upbit_cli.commands.withdraw import withdraw_app
 from upbit_cli.http_client import UpbitAPIError
 
 
@@ -90,6 +95,11 @@ def global_callback(
 
 
 app.add_typer(market_app, name="market", help="Market data: tickers, orderbooks, candles.")
+app.add_typer(account_app, name="account", help="Account balances (requires API credentials).")
+app.add_typer(order_app, name="order", help="Orders: place, list, cancel (requires API credentials).")
+app.add_typer(deposit_app, name="deposit", help="Deposits: list, get (requires API credentials).")
+app.add_typer(withdraw_app, name="withdraw", help="Withdrawals: list, get (requires API credentials).")
+app.add_typer(service_app, name="service", help="Service info: wallet status, API keys (requires API credentials).")
 app.add_typer(configure_app, name="configure", help="Save API credentials to ~/.upbit/config.json.")
 
 

@@ -208,3 +208,18 @@ def write_config(path: Path, access_key: str, secret_key: str) -> None:
         json.dumps({"access_key": access_key, "secret_key": secret_key}, indent=2),
         encoding="utf-8",
     )
+
+
+def _sample_accounts_response() -> List[Dict[str, Any]]:
+    """Minimal valid Upbit GET /v1/accounts response (for Exchange tests)."""
+    return [
+        {"currency": "KRW", "balance": "1000000.0", "locked": "0.0", "avg_buy_price": "0", "avg_buy_price_modified": False, "unit_currency": "KRW"},
+        {"currency": "BTC", "balance": "0.5", "locked": "0.1", "avg_buy_price": "50000000", "avg_buy_price_modified": False, "unit_currency": "KRW"},
+        {"currency": "ETH", "balance": "0.0", "locked": "0.0", "avg_buy_price": "0", "avg_buy_price_modified": False, "unit_currency": "KRW"},
+    ]
+
+
+@pytest.fixture
+def sample_accounts_response() -> List[Dict[str, Any]]:
+    """Raw accounts JSON as returned by Upbit API (GET /v1/accounts)."""
+    return _sample_accounts_response()
